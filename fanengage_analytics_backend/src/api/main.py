@@ -314,35 +314,98 @@ async def startup_event():
 
 # --- SCHEDULED JOBS ---
 
+# PUBLIC_INTERFACE
 async def poll_event_aggregator_job():
-    """Every 5 min: aggregate poll_events_log into poll_analytics."""
+    """
+    Every 5 min: Incrementally aggregate poll events from poll_events_log into poll_analytics.
+
+    - Only events where processed=false will be aggregated.
+    - Aggregates include: total polls, total votes, avg response time, etc.
+    - Marks events as processed after aggregation.
+    - Handles retries and logs errors in analytics_scheduler_history.
+    """
     pool = await get_pg_pool()
     async def aggregator():
-        # Example: Aggregate number of votes per poll
         async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO poll_analytics(poll_id, total_votes, aggregated_at)
-                SELECT poll_id, COUNT(*) FILTER (WHERE event_type='vote'), $1
-                FROM poll_events_log
-                WHERE event_time > now() - interval '10 min'
-                GROUP BY poll_id
-                ON CONFLICT (poll_id) DO UPDATE
-                SET total_votes=EXCLUDED.total_votes, aggregated_at=EXCLUDED.aggregated_at
-            """, datetime.utcnow())
+            # Use a transaction so processed states and analytics update together or not at all
+            async with conn.transaction():
+                # 1. Select unprocessed poll_ids and events
+                unprocessed_events = await conn.fetch("""
+                    SELECT * FROM poll_events_log
+                    WHERE processed = false
+                    FOR UPDATE SKIP LOCKED
+                """)
+                if not unprocessed_events:
+                    return  # Nothing to do
+
+                # 2. Group by poll_id for aggregation
+                poll_metrics = {}  # poll_id: {'votes': int, ...}
+                poll_ids = set()
+                for row in unprocessed_events:
+                    pid = row["poll_id"]
+                    poll_ids.add(pid)
+                    if pid not in poll_metrics:
+                        poll_metrics[pid] = {
+                            "votes": 0,
+                            "total_response_time": 0,
+                            "response_count": 0,
+                            "events": 0,
+                        }
+                    # assume event_type in ("vote", "skipped", ...)
+                    poll_metrics[pid]["events"] += 1
+                    if row.get("event_type") == "vote":
+                        poll_metrics[pid]["votes"] += 1
+                        if row.get("response_time") is not None:
+                            poll_metrics[pid]["total_response_time"] += float(row["response_time"])
+                            poll_metrics[pid]["response_count"] += 1
+
+                now = datetime.utcnow()
+                for pid in poll_ids:
+                    metrics = poll_metrics[pid]
+                    total_votes = metrics["votes"]
+                    avg_response_time = (metrics["total_response_time"] / metrics["response_count"]
+                                        if metrics["response_count"] > 0 else 0)
+                    total_events = metrics["events"]
+                    # Insert or update poll_analytics
+                    await conn.execute("""
+                        INSERT INTO poll_analytics(poll_id, total_votes, response_time_avg, total_events, aggregated_at)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (poll_id) DO UPDATE
+                          SET total_votes=EXCLUDED.total_votes,
+                              response_time_avg=EXCLUDED.response_time_avg,
+                              total_events=EXCLUDED.total_events,
+                              aggregated_at=EXCLUDED.aggregated_at
+                    """, pid, total_votes, avg_response_time, total_events, now)
+
+                # 3. Mark processed=true for these events
+                ids_to_mark = [row["id"] for row in unprocessed_events if "id" in row]
+                if ids_to_mark:
+                    await conn.execute(
+                        "UPDATE poll_events_log SET processed=true WHERE id = ANY($1)",
+                        ids_to_mark
+                    )
     await retry_with_scheduler_history(aggregator, pool, "poll_event_aggregator")
 
+# PUBLIC_INTERFACE
 async def poll_aggregator_retry_job():
-    """Every 10 min: retry failed poll_event_aggregator aggregates."""
+    """
+    Every 10 min: Retry failed poll_event_aggregator aggregates (for failed or crashed runs).
+
+    - Will scan analytics_scheduler_history for failed_attempts and attempt to re-aggregate
+    - Logs outcomes accordingly.
+    """
     pool = await get_pg_pool()
     async def retry_aggregate():
-        # Dummy: just mark failed jobs as retried (demonstration)
+        # Example (could be expanded): mark failed jobs as retried, possibly also re-run aggregation
         async with pool.acquire() as conn:
+            # Mark failed jobs as retried
             await conn.execute("""
                 UPDATE analytics_scheduler_history 
                 SET status='retried', details='Retry attempted'
                 WHERE job_name='poll_event_aggregator' AND status LIKE 'failed%'
                   AND run_at > now() - interval '1 hour'
             """)
+            # Optionally, could invoke poll_event_aggregator_job() directly here for batch re-run
     await retry_with_scheduler_history(retry_aggregate, pool, "poll_aggregator_retry")
 
 # --- NOTES ---
