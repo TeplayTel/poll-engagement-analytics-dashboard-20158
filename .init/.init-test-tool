@@ -1,0 +1,4 @@
+{
+    "command": "pytest",
+    "working_directory": "/home/kavia/workspace/code-generation/poll-engagement-analytics-dashboard-20158/fanengage_analytics_backend"
+}
